@@ -5,7 +5,6 @@ beautifulsoup4==4.12.2
 schedule==1.2.0
 flask==2.3.3
 gunicorn==21.2.0
-sqlite3
 pytz==2023.3
 aiofiles==23.2.1
 APScheduler==3.10.4
