@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Render.com compatible Telegram Bot
-All common issues fixed: Port, Webhook, Storage, etc.
+Telegram Bot for Render.com
+All fixes included: Port 10000, Webhook, Database, Background tasks
 """
 
 import os
 import sys
 import logging
 import asyncio
-from threading import Thread
-from datetime import datetime
+import time
 import sqlite3
 import json
-import shutil
 from pathlib import Path
+from threading import Thread
+from datetime import datetime
+from urllib.parse import urlparse
 
 # Third party imports
-import telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,7 +26,6 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler
 )
-from telegram.error import TelegramError
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -34,71 +33,48 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import aiofiles
 
 # For Render web server
-from flask import Flask, request, jsonify
+from flask import Flask, request
 
 # Load environment variables
 load_dotenv()
 
-# =================== RENDER SPECIFIC FIXES ===================
-# Problem 1: Port detection fix
-def get_port():
-    """Get port from environment with fallback"""
-    port = os.environ.get('PORT')
-    if port:
-        return int(port)
-    # Check common Render ports
-    for p in [10000, 8080, 5000, 3000]:
-        try:
-            # Try to bind to port
-            return p
-        except:
-            continue
-    return 10000  # Default fallback
-
-# Problem 2: Webhook URL fix for Render
-def get_webhook_url():
-    """Get webhook URL for Render"""
-    external_url = os.environ.get('RENDER_EXTERNAL_URL')
-    if external_url:
-        return f"{external_url}/webhook"
-    
-    # For local testing
-    return "https://your-bot.onrender.com/webhook"
-
 # =================== CONFIGURATION ===================
 class Config:
-    # Telegram
+    # Telegram Bot Token (Render Environment Variables se)
     BOT_TOKEN = os.environ.get('BOT_TOKEN')
-    OWNER_ID = int(os.environ.get('OWNER_ID', '0'))
     
-    # Render Specific
-    PORT = get_port()
+    # Bot Owner ID (Your Telegram User ID)
+    OWNER_ID = int(os.environ.get('OWNER_ID', '123456789'))
+    
+    # Render Specific Settings
+    PORT = int(os.environ.get('PORT', 10000))
     IS_RENDER = os.environ.get('RENDER', 'false').lower() == 'true'
-    WEBHOOK_URL = get_webhook_url()
+    
+    # Get Render external URL
+    RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if RENDER_EXTERNAL_URL:
+        WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/webhook"
+    else:
+        WEBHOOK_URL = "https://your-bot-name.onrender.com/webhook"
     
     # Bot Settings
-    AUTO_DELETE_TIME = int(os.environ.get('AUTO_DELETE_TIME', '5'))
-    CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '1800'))
-    MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '2000000000'))
+    AUTO_DELETE_TIME = 5  # seconds
+    CHECK_INTERVAL = 1800  # 30 minutes
+    MAX_FILE_SIZE = 2000000000  # 2GB
     
-    # Paths (Render ke liye writable paths)
+    # Paths for Render (temporary storage)
     BASE_DIR = Path(__file__).parent
-    if IS_RENDER:
-        # Render par temporary storage use karein
-        DATA_DIR = BASE_DIR / 'data'
-        TEMP_DIR = BASE_DIR / 'tmp'
-    else:
-        DATA_DIR = BASE_DIR / 'data'
-        TEMP_DIR = BASE_DIR / 'temp_files'
+    DATA_DIR = BASE_DIR / 'data'
+    TEMP_DIR = BASE_DIR / 'temp_files'
     
     # Create directories
     DATA_DIR.mkdir(exist_ok=True)
     TEMP_DIR.mkdir(exist_ok=True)
     
-    # Database
+    # Database path
     DB_PATH = DATA_DIR / 'bot_database.db'
     
-    # Logging
+    # Logging directory
     LOG_DIR = BASE_DIR / 'logs'
     LOG_DIR.mkdir(exist_ok=True)
 
@@ -116,7 +92,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# =================== DATABASE SETUP ===================
+# =================== DATABASE ===================
 class Database:
     def __init__(self):
         self.conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
@@ -134,7 +110,6 @@ class Database:
                 group_id TEXT,
                 folder TEXT,
                 file_types TEXT,
-                check_interval INTEGER DEFAULT 1800,
                 last_checked DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -149,20 +124,16 @@ class Database:
                 file_name TEXT,
                 file_size INTEGER,
                 downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                sent_to_group BOOLEAN DEFAULT 0,
                 FOREIGN KEY (website_id) REFERENCES websites (id)
             )
         ''')
         
-        # Groups table
+        # Bot settings table
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS groups (
+            CREATE TABLE IF NOT EXISTS settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id TEXT UNIQUE,
-                group_name TEXT,
-                folder_name TEXT,
-                settings TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                key TEXT UNIQUE,
+                value TEXT
             )
         ''')
         
@@ -179,13 +150,28 @@ class Database:
             self.conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Error adding website: {e}")
+            logger.error(f"Database error adding website: {e}")
             return False
     
     def get_websites(self):
         """Get all websites"""
         self.cursor.execute('SELECT * FROM websites')
         return self.cursor.fetchall()
+    
+    def get_website_by_url(self, url):
+        """Get website by URL"""
+        self.cursor.execute('SELECT * FROM websites WHERE url = ?', (url,))
+        return self.cursor.fetchone()
+    
+    def delete_website(self, url):
+        """Delete website"""
+        try:
+            self.cursor.execute('DELETE FROM websites WHERE url = ?', (url,))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Database error deleting website: {e}")
+            return False
     
     def mark_file_downloaded(self, website_id, file_url, file_name, file_size):
         """Mark a file as downloaded"""
@@ -198,7 +184,7 @@ class Database:
             self.conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Error marking file: {e}")
+            logger.error(f"Database error marking file: {e}")
             return False
     
     def is_file_downloaded(self, file_url):
@@ -210,22 +196,50 @@ class Database:
         return self.cursor.fetchone() is not None
     
     def cleanup_old_temp_files(self):
-        """Cleanup old temporary files"""
+        """Cleanup old temporary files from database"""
         try:
-            # Delete files older than 24 hours from temp directory
-            temp_dir = config.TEMP_DIR
-            for file_path in temp_dir.glob('*'):
-                if file_path.stat().st_mtime < (time.time() - 86400):
-                    file_path.unlink()
+            # Delete records older than 7 days
+            self.cursor.execute('''
+                DELETE FROM downloaded_files 
+                WHERE downloaded_at < datetime('now', '-7 days')
+            ''')
+            self.conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+            logger.error(f"Database cleanup error: {e}")
             return False
+    
+    def close(self):
+        """Close database connection"""
+        self.conn.close()
 
 # Initialize database
 db = Database()
 
-# =================== BOT SECURITY ===================
+# =================== FLASK WEB SERVER ===================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return {
+        "status": "online",
+        "service": "Telegram Bot",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.route('/health')
+def health():
+    return {"status": "healthy"}
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook endpoint"""
+    if request.method == "POST":
+        # Webhook processing will be handled by python-telegram-bot
+        return "OK"
+    return "Method not allowed", 405
+
+# =================== BOT HANDLERS ===================
 def is_owner(user_id):
     """Check if user is owner"""
     return user_id == config.OWNER_ID
@@ -238,6 +252,229 @@ async def delete_message_after(message, seconds):
     except:
         pass
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        await update.message.reply_text("❌ Unauthorized access!")
+        return
+    
+    welcome_text = """
+🤖 *Website Monitor Bot*
+
+*Available Commands:*
+/addsite <url> <folder> <file_types> - Add website to monitor
+/listsites - List all monitored websites
+/delsite <url> - Remove website
+/checknow - Check all websites now
+/status - Bot status
+/cleanup - Clean temporary files
+
+*Example:*
+`/addsite https://example.com/downloads videos mp4,avi,mkv`
+    """
+    
+    msg = await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await delete_message_after(msg, 10)
+    
+    # Delete user's command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def add_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /addsite command"""
+    if not is_owner(update.effective_user.id):
+        return
+    
+    if len(context.args) < 3:
+        help_text = """
+📝 *Usage:*
+`/addsite <url> <folder_name> <file_types>`
+
+*Example:*
+`/addsite https://example.com/videos my_videos mp4,avi,mkv`
+`/addsite https://site.com/documents pdfs pdf,doc,docx`
+        """
+        msg = await update.message.reply_text(help_text, parse_mode='Markdown')
+        await delete_message_after(msg, 10)
+        return
+    
+    url = context.args[0]
+    folder = context.args[1]
+    file_types = context.args[2]
+    group_id = str(update.effective_chat.id)
+    
+    # Extract website name from URL
+    try:
+        parsed = urlparse(url)
+        name = parsed.netloc
+    except:
+        name = url
+    
+    # Add to database
+    if db.add_website(url, name, group_id, folder, file_types):
+        response = f"""
+✅ *Website Added Successfully!*
+
+*URL:* `{url}`
+*Name:* {name}
+*Folder:* {folder}
+*File Types:* {file_types}
+*Group ID:* `{group_id}`
+        """
+    else:
+        response = "❌ Failed to add website. It might already exist."
+    
+    msg = await update.message.reply_text(response, parse_mode='Markdown')
+    await delete_message_after(msg, 5)
+    
+    # Delete command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def list_sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /listsites command"""
+    if not is_owner(update.effective_user.id):
+        return
+    
+    websites = db.get_websites()
+    
+    if not websites:
+        msg = await update.message.reply_text("📭 No websites are being monitored.")
+        await delete_message_after(msg, 5)
+        return
+    
+    response = "📋 *Monitored Websites:*\n\n"
+    for site in websites:
+        response += f"• *{site[2]}* (`{site[1]}`)\n"
+        response += f"  Folder: `{site[4]}` | Types: `{site[5]}`\n\n"
+    
+    # Split if message is too long
+    if len(response) > 4000:
+        chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
+        for chunk in chunks:
+            msg = await update.message.reply_text(chunk, parse_mode='Markdown')
+            await delete_message_after(msg, 10)
+    else:
+        msg = await update.message.reply_text(response, parse_mode='Markdown')
+        await delete_message_after(msg, 10)
+    
+    # Delete command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def delete_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /delsite command"""
+    if not is_owner(update.effective_user.id):
+        return
+    
+    if not context.args:
+        msg = await update.message.reply_text("Usage: `/delsite <url>`", parse_mode='Markdown')
+        await delete_message_after(msg, 5)
+        return
+    
+    url = context.args[0]
+    
+    if db.delete_website(url):
+        msg = await update.message.reply_text(f"✅ Website removed: `{url}`", parse_mode='Markdown')
+    else:
+        msg = await update.message.reply_text(f"❌ Website not found: `{url}`", parse_mode='Markdown')
+    
+    await delete_message_after(msg, 5)
+    
+    # Delete command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command"""
+    if not is_owner(update.effective_user.id):
+        return
+    
+    websites = db.get_websites()
+    
+    status_text = f"""
+📊 *Bot Status*
+
+*Environment:* {'Render.com' if config.IS_RENDER else 'Local'}
+*Port:* `{config.PORT}`
+*Webhook:* `{config.WEBHOOK_URL}`
+*Monitored Websites:* {len(websites)}
+*Temp Files:* {len(list(config.TEMP_DIR.glob('*')))}
+*Database Size:* {config.DB_PATH.stat().st_size // 1024} KB
+*Uptime:* {time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time))}
+    """
+    
+    msg = await update.message.reply_text(status_text, parse_mode='Markdown')
+    await delete_message_after(msg, 10)
+    
+    # Delete command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /cleanup command"""
+    if not is_owner(update.effective_user.id):
+        return
+    
+    # Clean temp directory
+    files_deleted = 0
+    for file_path in config.TEMP_DIR.glob('*'):
+        try:
+            file_path.unlink()
+            files_deleted += 1
+        except:
+            pass
+    
+    # Clean database
+    db.cleanup_old_temp_files()
+    
+    msg = await update.message.reply_text(
+        f"🧹 Cleanup completed!\n"
+        f"Deleted {files_deleted} temporary files."
+    )
+    await delete_message_after(msg, 5)
+    
+    # Delete command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def check_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /checknow command"""
+    if not is_owner(update.effective_user.id):
+        return
+    
+    msg = await update.message.reply_text("🔄 Checking all websites...")
+    
+    websites = db.get_websites()
+    if websites:
+        # Trigger background check
+        asyncio.create_task(check_all_websites())
+        await msg.edit_text(f"✅ Started checking {len(websites)} websites in background.")
+    else:
+        await msg.edit_text("📭 No websites to check.")
+    
+    await delete_message_after(msg, 5)
+    
+    # Delete command
+    try:
+        await update.message.delete()
+    except:
+        pass
+
 # =================== WEBSITE MONITORING ===================
 class WebsiteMonitor:
     def __init__(self):
@@ -246,408 +483,340 @@ class WebsiteMonitor:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
     
+    def extract_files_from_html(self, html, base_url, file_types):
+        """Extract file links from HTML"""
+        soup = BeautifulSoup(html, 'html.parser')
+        files = []
+        
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            
+            # Check if it's a file link
+            if self.is_file_link(href, file_types):
+                file_url = self.make_absolute_url(base_url, href)
+                file_name = link.text.strip() or href.split('/')[-1]
+                
+                files.append({
+                    'url': file_url,
+                    'name': file_name,
+                    'type': href.split('.')[-1].lower() if '.' in href else 'unknown'
+                })
+        
+        return files
+    
+    def is_file_link(self, url, file_types):
+        """Check if URL is a file based on extensions"""
+        if not file_types or file_types.lower() == 'all':
+            return True
+        
+        extensions = [ext.strip().lower() for ext in file_types.split(',')]
+        url_lower = url.lower()
+        
+        # Check if URL ends with any of the extensions
+        for ext in extensions:
+            if url_lower.endswith(f'.{ext}'):
+                return True
+        
+        # Also check for common file patterns
+        file_patterns = ['.mp4', '.avi', '.mkv', '.pdf', '.zip', '.rar', '.7z']
+        for pattern in file_patterns:
+            if pattern in url_lower:
+                return True
+        
+        return False
+    
+    def make_absolute_url(self, base_url, href):
+        """Convert relative URL to absolute"""
+        if href.startswith(('http://', 'https://')):
+            return href
+        elif href.startswith('/'):
+            parsed = urlparse(base_url)
+            return f"{parsed.scheme}://{parsed.netloc}{href}"
+        else:
+            # Relative URL
+            if base_url.endswith('/'):
+                return f"{base_url}{href}"
+            else:
+                return f"{base_url}/{href}"
+    
     async def check_website(self, website):
-        """Check website for new files"""
+        """Check a single website for new files"""
         try:
             response = self.session.get(website['url'], timeout=30)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            response.raise_for_status()
             
-            # Extract file links (customize based on website)
-            files = []
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if self.is_valid_file(href, website['file_types']):
-                    files.append({
-                        'url': self.make_absolute_url(website['url'], href),
-                        'name': link.text.strip() or href.split('/')[-1]
-                    })
+            files = self.extract_files_from_html(
+                response.text,
+                website['url'],
+                website['file_types']
+            )
             
             return files
         except Exception as e:
             logger.error(f"Error checking website {website['url']}: {e}")
             return []
     
-    def is_valid_file(self, url, file_types):
-        """Check if URL points to a valid file type"""
-        if not file_types:
-            return True
-        
-        file_types_list = file_types.split(',')
-        return any(url.lower().endswith(ftype.strip()) for ftype in file_types_list)
-    
-    def make_absolute_url(self, base_url, href):
-        """Convert relative URL to absolute"""
-        if href.startswith('http'):
-            return href
-        elif href.startswith('/'):
-            from urllib.parse import urlparse
-            parsed = urlparse(base_url)
-            return f"{parsed.scheme}://{parsed.netloc}{href}"
-        else:
-            return f"{base_url.rstrip('/')}/{href}"
-    
     async def download_file(self, file_url, file_name):
         """Download file to temporary storage"""
         try:
-            # Create temp file path
-            temp_file = config.TEMP_DIR / file_name
+            # Sanitize file name
+            safe_name = "".join(c for c in file_name if c.isalnum() or c in '._- ').strip()
+            if not safe_name:
+                safe_name = f"file_{int(time.time())}"
             
-            # Download file
+            temp_path = config.TEMP_DIR / safe_name
+            
+            # Download with progress
             response = self.session.get(file_url, stream=True, timeout=60)
             response.raise_for_status()
             
-            # Check file size
             file_size = int(response.headers.get('content-length', 0))
+            
+            # Check file size limit
             if file_size > config.MAX_FILE_SIZE:
-                logger.warning(f"File too large: {file_size}")
+                logger.warning(f"File too large: {file_size} bytes")
                 return None
             
-            # Save file
-            with open(temp_file, 'wb') as f:
+            # Download file
+            with open(temp_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
             
             return {
-                'path': temp_file,
+                'path': temp_path,
                 'size': file_size,
-                'name': file_name
+                'name': safe_name
             }
+            
         except Exception as e:
-            logger.error(f"Download error {file_url}: {e}")
+            logger.error(f"Error downloading {file_url}: {e}")
             return None
 
 # Initialize monitor
 monitor = WebsiteMonitor()
 
-# =================== TELEGRAM BOT HANDLERS ===================
-class TelegramBot:
-    def __init__(self):
-        self.application = None
-        self.bot = None
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        if not is_owner(update.effective_user.id):
-            return
-        
-        # Auto-delete command message (if in group)
-        if update.effective_chat.type != 'private':
-            try:
-                await update.message.delete()
-            except:
-                pass
-        
-        welcome_msg = await update.message.reply_text(
-            "🔐 Private Bot Activated\n\n"
-            "Commands (auto-delete in 5s):\n"
-            "/addsite - Add website\n"
-            "/listsites - Show websites\n"
-            "/backlog - Download existing\n"
-            "/status - Bot status\n"
-            "/cleanup - Clean temp files"
-        )
-        
-        # Auto delete welcome message
-        await delete_message_after(welcome_msg, 5)
-    
-    async def add_site(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /addsite command"""
-        if not is_owner(update.effective_user.id):
-            return
-        
-        # Parse arguments
-        if not context.args:
-            msg = await update.message.reply_text(
-                "Usage: /addsite <url> <folder_name> <file_types>\n"
-                "Example: /addsite https://example.com/videos my_videos mp4,avi"
-            )
-            await delete_message_after(msg, 10)
-            return
-        
-        url = context.args[0]
-        folder = context.args[1] if len(context.args) > 1 else "default"
-        file_types = context.args[2] if len(context.args) > 2 else "mp4,pdf"
-        group_id = str(update.effective_chat.id)
-        
-        # Add to database
-        success = db.add_website(
-            url=url,
-            name=url.split('/')[2],
-            group_id=group_id,
-            folder=folder,
-            file_types=file_types
-        )
-        
-        if success:
-            msg = await update.message.reply_text(
-                f"✅ Website added!\n"
-                f"URL: {url}\n"
-                f"Folder: {folder}\n"
-                f"Group: {group_id}"
-            )
-            # Auto delete after 5 seconds
-            await delete_message_after(msg, 5)
-        else:
-            msg = await update.message.reply_text("❌ Failed to add website")
-            await delete_message_after(msg, 5)
-        
-        # Try to delete user's command
-        try:
-            await update.message.delete()
-        except:
-            pass
-    
-    async def send_file_to_group(self, file_path, group_id, caption=""):
-        """Send file to Telegram group"""
-        try:
-            file_size = os.path.getsize(file_path)
-            
-            if file_size > 50 * 1024 * 1024:  # 50MB
-                # Use file chunking for large files
-                await self.send_large_file(file_path, group_id, caption)
-            else:
-                # Send directly for small files
-                async with aiofiles.open(file_path, 'rb') as f:
-                    await self.bot.send_document(
-                        chat_id=group_id,
-                        document=f,
-                        caption=caption[:1024] if caption else None,
-                        read_timeout=60,
-                        write_timeout=60,
-                        connect_timeout=60
-                    )
-            
-            # Cleanup temp file
-            try:
-                os.remove(file_path)
-            except:
-                pass
-            
-            return True
-        except Exception as e:
-            logger.error(f"Send file error: {e}")
-            return False
-    
-    async def send_large_file(self, file_path, group_id, caption):
-        """Send large file in chunks"""
-        # Telegram supports up to 2GB, but we need to handle carefully
-        chunk_size = 50 * 1024 * 1024  # 50MB chunks
-        
-        with open(file_path, 'rb') as f:
-            chunk_num = 0
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                
-                # Save chunk to temp file
-                chunk_file = f"{file_path}_part{chunk_num}"
-                with open(chunk_file, 'wb') as cf:
-                    cf.write(chunk)
-                
-                # Send chunk
-                async with aiofiles.open(chunk_file, 'rb') as cf:
-                    await self.bot.send_document(
-                        chat_id=group_id,
-                        document=cf,
-                        caption=f"{caption} (Part {chunk_num + 1})" if caption else f"Part {chunk_num + 1}",
-                        read_timeout=60,
-                        write_timeout=60,
-                        connect_timeout=60
-                    )
-                
-                # Cleanup chunk file
-                try:
-                    os.remove(chunk_file)
-                except:
-                    pass
-                
-                chunk_num += 1
-
-# =================== RENDER WEB SERVER ===================
-# Problem 3: Render needs a web server running
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return jsonify({
-        "status": "online",
-        "service": "Telegram Bot",
-        "deployed_on": "Render.com",
-        "owner_id": config.OWNER_ID
-    })
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"})
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Telegram webhook endpoint"""
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), bot)
-        asyncio.run(process_update(update))
-    return "OK"
 
 # =================== BACKGROUND TASKS ===================
-def start_background_tasks():
-    """Start background tasks for monitoring"""
+def start_background_scheduler():
+    """Start background scheduler for periodic tasks"""
     scheduler = BackgroundScheduler()
     
-    # Website checking task
+    # Website checking job (every 30 minutes)
     scheduler.add_job(
-        check_all_websites,
+        lambda: asyncio.run(check_all_websites()),
         'interval',
-        seconds=config.CHECK_INTERVAL,
-        id='website_check'
+        minutes=30,
+        id='website_check',
+        misfire_grace_time=300
     )
     
-    # Temp cleanup task (Render storage management)
+    # Cleanup job (every 6 hours)
     scheduler.add_job(
-        db.cleanup_old_temp_files,
+        lambda: asyncio.run(cleanup_temp_files()),
         'interval',
-        hours=1,
+        hours=6,
         id='cleanup'
     )
     
-    # Keep-alive task for Render free tier
+    # Keep-alive ping for Render (every 10 minutes)
     if config.IS_RENDER:
         scheduler.add_job(
             keep_alive_ping,
             'interval',
-            minutes=14,  # Render free tier sleeps after 15 minutes
+            minutes=10,
             id='keep_alive'
         )
     
     scheduler.start()
+    logger.info("Background scheduler started")
 
 async def check_all_websites():
-    """Check all registered websites"""
+    """Check all websites for new files"""
+    logger.info("Starting website check...")
     websites = db.get_websites()
-    for website in websites:
-        try:
-            files = await monitor.check_website({
-                'url': website[1],
-                'file_types': website[5]
-            })
-            
-            for file_info in files:
-                if not db.is_file_downloaded(file_info['url']):
-                    # Download file
-                    downloaded = await monitor.download_file(
-                        file_info['url'],
-                        file_info['name']
-                    )
-                    
-                    if downloaded:
-                        # Send to group
-                        await bot.send_document(
-                            chat_id=website[3],  # group_id
-                            document=open(downloaded['path'], 'rb'),
-                            caption=f"📁 {website[4]}/{file_info['name']}"
-                        )
-                        
-                        # Mark as downloaded
-                        db.mark_file_downloaded(
-                            website[0],  # website_id
-                            file_info['url'],
-                            file_info['name'],
-                            downloaded['size']
-                        )
-                        
-                        # Cleanup
-                        try:
-                            os.remove(downloaded['path'])
-                        except:
-                            pass
-                        
-                        # Delay between files
-                        await asyncio.sleep(2)
+    
+    if not websites:
+        logger.info("No websites to check")
+        return
+    
+    total_files = 0
+    
+    for site in websites:
+        website_info = {
+            'id': site[0],
+            'url': site[1],
+            'name': site[2],
+            'group_id': site[3],
+            'folder': site[4],
+            'file_types': site[5]
+        }
         
+        logger.info(f"Checking website: {website_info['name']} ({website_info['url']})")
+        
+        try:
+            files = await monitor.check_website(website_info)
+            
+            if files:
+                logger.info(f"Found {len(files)} files on {website_info['name']}")
+                
+                # Process each file
+                for file_info in files:
+                    if not db.is_file_downloaded(file_info['url']):
+                        # Download file
+                        downloaded = await monitor.download_file(
+                            file_info['url'],
+                            file_info['name']
+                        )
+                        
+                        if downloaded:
+                            logger.info(f"Downloaded: {file_info['name']} ({downloaded['size']} bytes)")
+                            
+                            # Mark as downloaded in database
+                            db.mark_file_downloaded(
+                                website_info['id'],
+                                file_info['url'],
+                                file_info['name'],
+                                downloaded['size']
+                            )
+                            
+                            total_files += 1
+                            
+                            # Clean up temp file
+                            try:
+                                downloaded['path'].unlink()
+                            except:
+                                pass
+                            
+                            # Small delay between files
+                            await asyncio.sleep(1)
+            
+            # Update last checked time
+            db.cursor.execute(
+                'UPDATE websites SET last_checked = CURRENT_TIMESTAMP WHERE id = ?',
+                (website_info['id'],)
+            )
+            db.conn.commit()
+            
         except Exception as e:
-            logger.error(f"Error processing website {website[1]}: {e}")
+            logger.error(f"Error processing website {website_info['url']}: {e}")
+            continue
+    
+    if total_files > 0:
+        logger.info(f"Downloaded {total_files} new files in this check")
+
+async def cleanup_temp_files():
+    """Cleanup old temporary files"""
+    logger.info("Starting temp file cleanup...")
+    
+    deleted_count = 0
+    current_time = time.time()
+    
+    for file_path in config.TEMP_DIR.glob('*'):
+        try:
+            # Delete files older than 1 hour
+            if current_time - file_path.stat().st_mtime > 3600:
+                file_path.unlink()
+                deleted_count += 1
+        except Exception as e:
+            logger.error(f"Error deleting {file_path}: {e}")
+    
+    # Clean database records
+    db.cleanup_old_temp_files()
+    
+    logger.info(f"Cleaned up {deleted_count} temporary files")
 
 def keep_alive_ping():
-    """Keep Render app alive by pinging itself"""
+    """Ping own health endpoint to keep Render app awake"""
     try:
         if config.IS_RENDER and config.WEBHOOK_URL:
-            # Ping the health endpoint
-            requests.get(config.WEBHOOK_URL.replace('/webhook', '/health'), timeout=10)
-            logger.info("Keep-alive ping sent")
+            health_url = config.WEBHOOK_URL.replace('/webhook', '/health')
+            requests.get(health_url, timeout=5)
+            logger.debug("Keep-alive ping sent")
     except Exception as e:
         logger.warning(f"Keep-alive ping failed: {e}")
 
-# =================== MAIN SETUP ===================
+# =================== MAIN FUNCTION ===================
 async def main():
     """Main function to start the bot"""
-    global bot
+    global start_time
+    start_time = time.time()
     
-    # Create application
+    logger.info("=" * 50)
+    logger.info("Starting Telegram Bot...")
+    logger.info(f"Environment: {'Render.com' if config.IS_RENDER else 'Local'}")
+    logger.info(f"Port: {config.PORT}")
+    logger.info(f"Webhook URL: {config.WEBHOOK_URL}")
+    
+    # Check essential configuration
+    if not config.BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN not found in environment variables!")
+        sys.exit(1)
+    
+    # Create Application
     application = Application.builder().token(config.BOT_TOKEN).build()
-    bot = application.bot
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", TelegramBot().start))
-    application.add_handler(CommandHandler("addsite", TelegramBot().add_site))
-    # Add more handlers as needed...
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("addsite", add_site_command))
+    application.add_handler(CommandHandler("listsites", list_sites_command))
+    application.add_handler(CommandHandler("delsite", delete_site_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
+    application.add_handler(CommandHandler("checknow", check_now_command))
     
     # Start background tasks
-    start_background_tasks()
+    start_background_scheduler()
     
-    # Configure for Render (webhook) or local (polling)
+    # Configure for Render (webhook) or Local (polling)
     if config.IS_RENDER:
-        # Set webhook for Render
+        logger.info("Configuring for Render.com (Webhook mode)...")
+        
+        # Set webhook
         await application.bot.set_webhook(
             url=config.WEBHOOK_URL,
-            drop_pending_updates=True
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
         )
         logger.info(f"Webhook set to: {config.WEBHOOK_URL}")
         
-        # Start Flask server
-        from threading import Thread
-        flask_thread = Thread(target=lambda: app.run(
-            host='0.0.0.0',
-            port=config.PORT,
-            debug=False,
-            use_reloader=False
-        ))
+        # Start Flask server in a separate thread
+        flask_thread = Thread(
+            target=lambda: app.run(
+                host='0.0.0.0',
+                port=config.PORT,
+                debug=False,
+                use_reloader=False,
+                threaded=True
+            ),
+            daemon=True
+        )
         flask_thread.start()
+        logger.info(f"Flask server started on port {config.PORT}")
         
-        # Keep the asyncio loop running
-        while True:
-            await asyncio.sleep(3600)
-    
+        # Keep the application running
+        logger.info("Bot is running on Render.com with webhook!")
+        await asyncio.Event().wait()
+        
     else:
-        # Use polling for local development
+        logger.info("Configuring for Local (Polling mode)...")
+        
+        # Start polling
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
         
-        # Run forever
+        logger.info("Bot is running locally with polling!")
+        
+        # Keep running
         await asyncio.Event().wait()
 
-# =================== RENDER STARTUP SCRIPT ===================
+# =================== ENTRY POINT ===================
 if __name__ == "__main__":
-    # Render-specific startup checks
-    if config.IS_RENDER:
-        logger.info("Starting on Render.com environment")
-        logger.info(f"Port: {config.PORT}")
-        logger.info(f"Webhook URL: {config.WEBHOOK_URL}")
-        
-        # Check essential config
-        if not config.BOT_TOKEN:
-            logger.error("BOT_TOKEN not set in environment variables!")
-            sys.exit(1)
-        
-        if not config.OWNER_ID:
-            logger.error("OWNER_ID not set!")
-            sys.exit(1)
-        
-        # Start the bot
+    try:
         asyncio.run(main())
-    
-    else:
-        # Local development
-        logger.info("Starting in local development mode")
-        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
