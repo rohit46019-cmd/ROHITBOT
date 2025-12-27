@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Bot for Render.com
-All fixes included: Port 10000, Webhook, Database, Background tasks
+Telegram Bot for Render.com - FIXED VERSION
 """
 
 import os
@@ -12,7 +11,7 @@ import time
 import sqlite3
 import json
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Event
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -30,10 +29,9 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
-import aiofiles
 
 # For Render web server
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 # Load environment variables
 load_dotenv()
@@ -55,7 +53,7 @@ class Config:
     if RENDER_EXTERNAL_URL:
         WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/webhook"
     else:
-        WEBHOOK_URL = "https://your-bot-name.onrender.com/webhook"
+        WEBHOOK_URL = "https://rohitbot-c2rs.onrender.com/webhook"
     
     # Bot Settings
     AUTO_DELETE_TIME = 5  # seconds
@@ -218,26 +216,38 @@ db = Database()
 
 # =================== FLASK WEB SERVER ===================
 app = Flask(__name__)
+stop_event = Event()
 
 @app.route('/')
 def home():
-    return {
+    return jsonify({
         "status": "online",
         "service": "Telegram Bot",
-        "timestamp": datetime.now().isoformat()
-    }
+        "timestamp": datetime.now().isoformat(),
+        "owner_id": config.OWNER_ID
+    })
 
 @app.route('/health')
 def health():
-    return {"status": "healthy"}
+    return jsonify({"status": "healthy", "bot": "running"})
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Telegram webhook endpoint"""
+    """Telegram webhook endpoint - FIXED"""
     if request.method == "POST":
-        # Webhook processing will be handled by python-telegram-bot
-        return "OK"
-    return "Method not allowed", 405
+        try:
+            # Get the update from Telegram
+            update = Update.de_json(request.get_json(), bot)
+            
+            # Process the update
+            application.update_queue.put_nowait(update)
+            
+            return jsonify({"status": "ok"}), 200
+        except Exception as e:
+            logger.error(f"Error processing webhook: {e}")
+            return jsonify({"error": str(e)}), 400
+    
+    return jsonify({"error": "Method not allowed"}), 405
 
 # =================== BOT HANDLERS ===================
 def is_owner(user_id):
@@ -411,7 +421,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *Monitored Websites:* {len(websites)}
 *Temp Files:* {len(list(config.TEMP_DIR.glob('*')))}
 *Database Size:* {config.DB_PATH.stat().st_size // 1024} KB
-*Uptime:* {time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time))}
     """
     
     msg = await update.message.reply_text(status_text, parse_mode='Markdown')
@@ -596,7 +605,6 @@ class WebsiteMonitor:
 # Initialize monitor
 monitor = WebsiteMonitor()
 
-
 # =================== BACKGROUND TASKS ===================
 def start_background_scheduler():
     """Start background scheduler for periodic tasks"""
@@ -736,11 +744,24 @@ def keep_alive_ping():
     except Exception as e:
         logger.warning(f"Keep-alive ping failed: {e}")
 
+# =================== GLOBAL VARIABLES ===================
+application = None
+bot = None
+
 # =================== MAIN FUNCTION ===================
+def run_flask():
+    """Run Flask server"""
+    app.run(
+        host='0.0.0.0',
+        port=config.PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True
+    )
+
 async def main():
     """Main function to start the bot"""
-    global start_time
-    start_time = time.time()
+    global application, bot
     
     logger.info("=" * 50)
     logger.info("Starting Telegram Bot...")
@@ -755,6 +776,7 @@ async def main():
     
     # Create Application
     application = Application.builder().token(config.BOT_TOKEN).build()
+    bot = application.bot
     
     # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -765,12 +787,15 @@ async def main():
     application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("checknow", check_now_command))
     
-    # Start background tasks
+    # Start background scheduler
     start_background_scheduler()
     
     # Configure for Render (webhook) or Local (polling)
     if config.IS_RENDER:
         logger.info("Configuring for Render.com (Webhook mode)...")
+        
+        # Initialize application
+        await application.initialize()
         
         # Set webhook
         await application.bot.set_webhook(
@@ -780,23 +805,19 @@ async def main():
         )
         logger.info(f"Webhook set to: {config.WEBHOOK_URL}")
         
+        # Start application
+        await application.start()
+        
         # Start Flask server in a separate thread
-        flask_thread = Thread(
-            target=lambda: app.run(
-                host='0.0.0.0',
-                port=config.PORT,
-                debug=False,
-                use_reloader=False,
-                threaded=True
-            ),
-            daemon=True
-        )
+        flask_thread = Thread(target=run_flask, daemon=True)
         flask_thread.start()
         logger.info(f"Flask server started on port {config.PORT}")
         
-        # Keep the application running
         logger.info("Bot is running on Render.com with webhook!")
-        await asyncio.Event().wait()
+        
+        # Keep the application running
+        while not stop_event.is_set():
+            await asyncio.sleep(1)
         
     else:
         logger.info("Configuring for Local (Polling mode)...")
@@ -817,6 +838,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
+        stop_event.set()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)
