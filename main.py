@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Bot - File Downloader & Sender
-Files download करके Telegram में भेजेगा
+Fixed Version - Commands will work now
 """
 
 import os
@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -48,7 +49,8 @@ class Config:
     # Get Render external URL
     RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
     if RENDER_EXTERNAL_URL:
-        WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/webhook"
+        # FIX: Use correct webhook URL format
+        WEBHOOK_URL = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
     else:
         WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
     
@@ -206,7 +208,8 @@ def home():
     return jsonify({
         "status": "online",
         "service": "Telegram File Downloader Bot",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "mode": "webhook" if config.IS_RENDER else "polling"
     })
 
 @app.route('/health')
@@ -231,7 +234,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if not is_owner(user_id):
-        await update.message.reply_text("❌ Unauthorized access!")
+        msg = await update.message.reply_text("❌ Unauthorized access!")
+        await delete_message_after(msg, 5)
         return
     
     welcome_text = """
@@ -256,6 +260,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    logger.info(f"Start command received from {user_id}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
@@ -282,10 +287,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     
     await update.message.reply_text(help_text, parse_mode='Markdown')
+    logger.info(f"Help command received from {update.effective_user.id}")
 
 async def add_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addsite command"""
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        msg = await update.message.reply_text("❌ Unauthorized access!")
+        await delete_message_after(msg, 5)
         return
     
     if len(context.args) < 2:
@@ -318,6 +328,7 @@ async def add_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Bot हर 30 minutes में automatic check करेगा और new files भेजेगा।
         """
+        logger.info(f"Website added by {user_id}: {url}")
     else:
         response = "❌ Failed to add website."
     
@@ -325,7 +336,11 @@ Bot हर 30 minutes में automatic check करेगा और new files
 
 async def list_sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /listsites command"""
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        msg = await update.message.reply_text("❌ Unauthorized access!")
+        await delete_message_after(msg, 5)
         return
     
     websites = db.get_websites()
@@ -342,10 +357,15 @@ async def list_sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         response += f"   Chat: `{site[3]}`\n\n"
     
     await update.message.reply_text(response, parse_mode='Markdown')
+    logger.info(f"List sites command from {user_id}")
 
 async def delete_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /delsite command"""
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        msg = await update.message.reply_text("❌ Unauthorized access!")
+        await delete_message_after(msg, 5)
         return
     
     if not context.args:
@@ -356,12 +376,17 @@ async def delete_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if db.delete_website(url):
         await update.message.reply_text(f"✅ Removed: `{url}`", parse_mode='Markdown')
+        logger.info(f"Website deleted by {user_id}: {url}")
     else:
         await update.message.reply_text(f"❌ Not found: `{url}`", parse_mode='Markdown')
 
 async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /download command - Direct file download"""
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        msg = await update.message.reply_text("❌ Unauthorized access!")
+        await delete_message_after(msg, 5)
         return
     
     if not context.args:
@@ -395,6 +420,7 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Cleanup
             downloaded['path'].unlink()
+            logger.info(f"File downloaded by {user_id}: {file_url}")
         else:
             await msg.edit_text("❌ Failed to download file.")
             
@@ -404,7 +430,11 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command"""
-    if not is_owner(update.effective_user.id):
+    user_id = update.effective_user.id
+    
+    if not is_owner(user_id):
+        msg = await update.message.reply_text("❌ Unauthorized access!")
+        await delete_message_after(msg, 5)
         return
     
     websites = db.get_websites()
@@ -419,9 +449,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *Temp Files:* {len(list(config.TEMP_DIR.glob('*')))}
 *Owner ID:* `{config.OWNER_ID}`
 *Max File Size:* {config.MAX_FILE_SIZE // 1024 // 1024} MB
+*Mode:* {'Webhook (Render)' if config.IS_RENDER else 'Polling'}
     """
     
     await update.message.reply_text(status_text, parse_mode='Markdown')
+    logger.info(f"Status command from {user_id}")
 
 # =================== FILE DOWNLOAD FUNCTIONS ===================
 async def download_file(file_url):
@@ -478,6 +510,7 @@ async def send_file_to_user(chat_id, file_path, caption=""):
         file_size = file_path.stat().st_size
         
         if file_size > config.MAX_FILE_SIZE:
+            # Send message instead
             await application.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ File too large: {file_size // 1024 // 1024}MB (max {config.MAX_FILE_SIZE // 1024 // 1024}MB)"
@@ -653,11 +686,12 @@ def keep_alive_ping():
     try:
         if config.IS_RENDER and config.WEBHOOK_URL:
             health_url = config.WEBHOOK_URL.replace('/webhook', '/health')
-            requests.get(health_url, timeout=5)
-    except:
-        pass
+            response = requests.get(health_url, timeout=5)
+            logger.debug(f"Keep-alive ping: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Keep-alive ping failed: {e}")
 
-# =================== MAIN SETUP ===================
+# =================== BOT APPLICATION ===================
 application = None
 
 def setup_bot():
@@ -680,18 +714,12 @@ def setup_bot():
     application.add_handler(CommandHandler("download", download_command))
     application.add_handler(CommandHandler("status", status_command))
     
+    logger.info("Bot handlers set up successfully")
     return application
 
 def run_flask():
     """Run Flask server"""
-    @app.route('/webhook', methods=['POST'])
-    def webhook():
-        """Handle Telegram webhook"""
-        if request.method == "POST":
-            update = Update.de_json(request.get_json(), application.bot)
-            application.update_queue.put_nowait(update)
-        return "OK"
-    
+    logger.info(f"Starting Flask server on port {config.PORT}")
     app.run(
         host='0.0.0.0',
         port=config.PORT,
@@ -699,12 +727,37 @@ def run_flask():
         use_reloader=False
     )
 
-async def run_bot():
-    """Run the Telegram bot"""
+async def setup_webhook():
+    """Setup webhook for Render"""
+    global application
+    
+    if not config.WEBHOOK_URL:
+        logger.error("WEBHOOK_URL not configured!")
+        return False
+    
+    try:
+        # Set webhook
+        await application.bot.set_webhook(
+            url=config.WEBHOOK_URL,
+            drop_pending_updates=True
+        )
+        
+        # Verify webhook info
+        webhook_info = await application.bot.get_webhook_info()
+        logger.info(f"Webhook set: {config.WEBHOOK_URL}")
+        logger.info(f"Webhook info: {webhook_info.url}, Pending updates: {webhook_info.pending_update_count}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
+        return False
+
+async def run_bot_polling():
+    """Run bot in polling mode"""
     global application
     
     logger.info("=" * 50)
-    logger.info("Starting File Downloader Bot...")
+    logger.info("Starting File Downloader Bot in POLLING mode...")
     logger.info(f"Owner ID: {config.OWNER_ID}")
     
     # Setup bot
@@ -713,34 +766,79 @@ async def run_bot():
     # Start background scheduler
     start_background_scheduler()
     
-    if config.IS_RENDER and config.WEBHOOK_URL:
-        # Webhook mode for Render
-        logger.info("Running in Webhook mode...")
-        
-        await application.initialize()
-        await application.bot.set_webhook(
-            url=config.WEBHOOK_URL,
-            drop_pending_updates=True
-        )
-        await application.start()
-        
-        logger.info(f"Webhook set: {config.WEBHOOK_URL}")
-        
-        # Run Flask
-        run_flask()
-        
+    # Run polling
+    await application.run_polling()
+
+async def run_bot_webhook():
+    """Run bot in webhook mode (for Render)"""
+    global application
+    
+    logger.info("=" * 50)
+    logger.info("Starting File Downloader Bot in WEBHOOK mode...")
+    logger.info(f"Owner ID: {config.OWNER_ID}")
+    logger.info(f"Webhook URL: {config.WEBHOOK_URL}")
+    
+    # Setup bot
+    application = setup_bot()
+    
+    # Start background scheduler
+    start_background_scheduler()
+    
+    # Initialize application
+    await application.initialize()
+    
+    # Setup webhook
+    if not await setup_webhook():
+        logger.error("Failed to setup webhook, falling back to polling")
+        await run_bot_polling()
+        return
+    
+    # Start application
+    await application.start()
+    
+    logger.info("Bot started in webhook mode")
+    
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    logger.info("Flask server started in background thread")
+    
+    # Keep the bot running
+    try:
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
+    except KeyboardInterrupt:
+        logger.info("Bot stopping...")
+    finally:
         await application.stop()
-    else:
-        # Polling mode for local
-        logger.info("Running in Polling mode...")
-        await application.run_polling()
 
 # =================== ENTRY POINT ===================
-if __name__ == "__main__":
+def main():
+    """Main entry point"""
     try:
-        asyncio.run(run_bot())
+        # Check if BOT_TOKEN is set
+        if not config.BOT_TOKEN:
+            logger.error("❌ ERROR: BOT_TOKEN environment variable is not set!")
+            logger.error("Please set BOT_TOKEN in your environment variables")
+            sys.exit(1)
+        
+        # Check if OWNER_ID is set
+        if config.OWNER_ID == 123456789:
+            logger.warning("⚠️ WARNING: Using default OWNER_ID (123456789)")
+            logger.warning("Set OWNER_ID environment variable to your Telegram user ID")
+        
+        # Run in appropriate mode
+        if config.IS_RENDER and config.WEBHOOK_URL:
+            asyncio.run(run_bot_webhook())
+        else:
+            asyncio.run(run_bot_polling())
+            
     except KeyboardInterrupt:
-        logger.info("Bot stopped")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
